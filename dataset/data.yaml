@@ -1,0 +1,5 @@
+
+nc: 5
+names: ['car', 'motorcycle', 'bus', 'truck', 'bicycle']
+train: c:/Users/Mohamed Aashik/Downloads/Traffic vehicle detection/dataset/images/train
+val: c:/Users/Mohamed Aashik/Downloads/Traffic vehicle detection/dataset/images/val
