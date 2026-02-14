@@ -117,7 +117,7 @@ class SmartTrafficManagementSystem:
         """
         if vehicle_count < 10:
             duration_sec = 11
-        elif 20 <= vehicle_count <= 25:
+        elif 20 <= vehicle_count <= 30:
             duration_sec = 21
         elif vehicle_count > 30:
             duration_sec = 31
