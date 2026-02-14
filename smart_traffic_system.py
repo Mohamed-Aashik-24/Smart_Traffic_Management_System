@@ -4,6 +4,8 @@ from ultralytics import YOLO
 from collections import defaultdict
 import time
 from pathlib import Path
+import serial
+
 
 
 class SmartTrafficManagementSystem:
@@ -12,10 +14,14 @@ class SmartTrafficManagementSystem:
         Initialize the Smart Traffic Management System with vehicle detection
         This version prioritizes lanes with more vehicles
         """
+       
+
         print("Loading YOLO model...")
         self.model = YOLO(model_name)
         self.confidence_threshold = confidence_threshold
-        
+
+        self.arduino = serial.Serial('COM9', 9600)
+        time.sleep(2)
         # COCO dataset class IDs for vehicles
         self.vehicle_classes = {
             2: 'car',
@@ -111,8 +117,8 @@ class SmartTrafficManagementSystem:
         """
         if vehicle_count < 10:
             duration_sec = 11
-        elif 20 <= vehicle_count <= 25:
-            duration_sec = 21
+        elif 20 <= vehicle_count <= 30:
+            duration_sec = 26
         elif vehicle_count > 30:
             duration_sec = 31
         else:
@@ -220,6 +226,21 @@ class SmartTrafficManagementSystem:
         
         return frame
     
+    def send_to_arduino(self, lane):
+        """
+        Send green signal command to Arduino for specified lane
+        Arduino will automatically set all other lanes to RED
+        lane: 0-based lane index
+        """
+        if lane < 0:
+            return
+        
+        # Send green signal command for active lane
+        cmd = f"L{lane+1}_G\n"
+        self.arduino.write(cmd.encode())
+        
+        print(f"🚦 Arduino: Lane {lane+1} GREEN")
+
     def run_smart_traffic_system(self, video_paths, output_path='smart_traffic_output.mp4'):
         """
         Run the smart traffic management system with priority-based signal control
@@ -271,6 +292,7 @@ class SmartTrafficManagementSystem:
         
         frame_count = 0
         active_lane = -1  # Will be set based on priority
+        
         green_duration_sec = 0  # Duration in seconds
         yellow_duration_sec = self.yellow_duration_sec
         first_cycle = True
@@ -457,6 +479,7 @@ class SmartTrafficManagementSystem:
                 green_duration_sec = self.calculate_green_duration(int(avg_counts[active_lane]), fps) / fps
                 first_cycle = False
                 signal_start_time = time.time()  # Reset timer
+                self.send_to_arduino(active_lane)  # Send green signal to Arduino
                 print(f"\n>>> First green light: {lane_names[active_lane]} with {int(avg_counts[active_lane])} vehicles ({int(green_duration_sec)}s green + {int(yellow_duration_sec)}s yellow)")
             
             # Switch lanes after green duration (yellow is included in the last 5 seconds)
@@ -469,6 +492,9 @@ class SmartTrafficManagementSystem:
                 
                 # Reset timer for new signal cycle
                 signal_start_time = time.time()
+                
+                # Send green signal to Arduino for new lane
+                self.send_to_arduino(active_lane)
                 
                 print(f"\n>>> Switching to {lane_names[active_lane]} - {int(avg_counts[active_lane])} vehicles - {int(green_duration_sec)}s (last 5s yellow)")
             
