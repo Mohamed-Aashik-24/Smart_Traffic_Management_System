@@ -4,7 +4,6 @@ from ultralytics import YOLO
 from collections import defaultdict
 import time
 from pathlib import Path
-# import serial  # Disabled for running without Arduino
 
 
 
