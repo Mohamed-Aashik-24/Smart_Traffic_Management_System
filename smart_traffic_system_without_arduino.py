@@ -118,11 +118,11 @@ class SmartTrafficManagementSystem:
         Returns duration in frames
         """
         if vehicle_count < 10:
-            duration_sec = 11
+            duration_sec = 6
         elif 20 <= vehicle_count <= 30:
-            duration_sec = 21
+            duration_sec = 11
         elif vehicle_count > 30:
-            duration_sec = 31
+            duration_sec = 16
         else:
             # Between 10 and 20: scale between 15 and 25 seconds
             duration_sec = 15 + ((vehicle_count - 10) / 10) * 10
@@ -249,326 +249,322 @@ class SmartTrafficManagementSystem:
 
     def run_smart_traffic_system(self, video_paths):
         """
-        Run the smart traffic management system with priority-based signal control
-        First green light goes to lane with most vehicles, then alternates
+        Run the smart traffic management system with a sliding 4-lane window.
+
+        With N videos (e.g. 5), exactly 4 are displayed at a time in a 2x2 grid.
+        After every full 4-lane cycle, the window slides by 1:
+          Round 1 → Lanes 1-2-3-4
+          Round 2 → Lanes 2-3-4-5
+          Round 3 → Lanes 3-4-5-1  ... and so on.
+
+        First green light goes to the lane with the most vehicles (priority).
+        Subsequent lanes rotate sequentially within the current window.
         """
-        # Open video captures
-        caps = []
+        WINDOW_SIZE = 4  # always display this many lanes
+
+        # --- Open ALL video captures ---
+        all_caps = []
         for video_path in video_paths:
             cap = cv2.VideoCapture(str(video_path))
             if not cap.isOpened():
                 raise ValueError(f"Could not open video: {video_path}")
-            caps.append(cap)
-        
-        # Get video properties and screen size
-        fps = int(caps[0].get(cv2.CAP_PROP_FPS))
+            all_caps.append(cap)
+
+        num_total = len(all_caps)
+        if num_total < WINDOW_SIZE:
+            raise ValueError(f"Need at least {WINDOW_SIZE} videos, got {num_total}")
+
+        # --- Video / screen properties ---
+        fps = int(all_caps[0].get(cv2.CAP_PROP_FPS)) or 30
         self.fps = fps
-        
-        # Get screen resolution and calculate perfect fit
+
         import tkinter as tk
         root = tk.Tk()
-        screen_width = root.winfo_screenwidth()
+        screen_width  = root.winfo_screenwidth()
         screen_height = root.winfo_screenheight()
         root.destroy()
-        
-        # Use 90% of screen for better fit, account for taskbar
+
         usable_height = int(screen_height * 0.90)
-        usable_width = int(screen_width * 0.95)
-        
-        # Calculate dimensions for 2x2 grid
-        frame_width = usable_width // 2
-        frame_height = usable_height // 2
-        
-        # Calculate output video size (2x2 grid - 4 quarters)
-        output_width = frame_width * 2
+        usable_width  = int(screen_width  * 0.95)
+        frame_width   = usable_width  // 2
+        frame_height  = usable_height // 2
+        output_width  = frame_width  * 2
         output_height = frame_height * 2
-        
-        # Store current frame for each lane (for pause functionality)
-        current_frames = [None] * len(caps)
-        
-        print(f"\nProcessing videos in PRIORITY mode...")
-        print(f"Display: {output_width}x{output_height} @ {fps} FPS")
-        print(f"Layout: 2x2 Grid (Perfect Screen Fit)")
-        print(f"Green Light Timing: <10 cars=15s | 20-25 cars=25s | >30 cars=30s")
-        
-        frame_count = 0
-        active_lane = -1  # Will be set based on priority
-        
-        green_duration_sec = 0  # Duration in seconds
+
+        print(f"\nProcessing {num_total} videos — displaying {WINDOW_SIZE} at a time (sliding window)")
+        print(f"Display: {output_width}x{output_height} @ {fps} FPS  |  Layout: 2×2 Grid")
+        print(f"Round 1: L1-L2-L3-L4  →  Round 2: L2-L3-L4-L5  →  Round 3: L3-L4-L5-L1 ...")
+
+        lane_names = [f"LANE {i+1}" for i in range(num_total)]
+
+        # --- Per-cap tracking (indexed by absolute cap index 0..num_total-1) ---
+        current_frames  = [None] * num_total   # cached frame for pause effect
+        vehicle_counts  = [0]    * num_total
+        vehicle_history = [[]    for _ in range(num_total)]
+
+        # --- Sliding-window state ---
+        window_start    = 0   # which cap index is first in the visible 4
+        window_cycle    = 0   # greens given so far in this window (1-4)
+        window_round    = 1   # display round counter
+
+        # --- Signal state ---
+        frame_count        = 0
+        active_win_idx     = -1   # index 0-3 within visible window; -1 = not yet started
+        green_duration_sec = 0
         yellow_duration_sec = self.yellow_duration_sec
-        first_cycle = True
-        
-        # Time tracking for real-time countdown
-        signal_start_time = time.time()
-        
-        num_lanes = len(caps)
-        lane_names = [f"LANE {i+1}" for i in range(num_lanes)]
-        vehicle_counts = [0] * num_lanes
-        vehicle_history = [[] for _ in range(num_lanes)]  # Track vehicle counts over time
-        
+        first_cycle        = True
+        signal_start_time  = time.time()
+
+        # =====================================================================
         while True:
-            frames = []
-            
-            # Always read frames from all videos to keep them playing in loop
-            for i, cap in enumerate(caps):
-                # Determine signal state for this lane
-                is_active = (i == active_lane)
-                
-                # Calculate elapsed time for real-time countdown
-                elapsed_time = time.time() - signal_start_time
-                has_green_signal = is_active and elapsed_time < green_duration_sec
-                
-                # Always read new frame to keep video playing in loop
+            # Current visible 4 cap indices
+            visible   = [(window_start + i) % num_total for i in range(WINDOW_SIZE)]
+            win_label = " ".join([f"L{visible[i]+1}" for i in range(WINDOW_SIZE)])
+
+            elapsed_time = time.time() - signal_start_time
+
+            # -----------------------------------------------------------------
+            # 1. Read & cache frames for the 4 visible lanes
+            # -----------------------------------------------------------------
+            raw_frames = []  # list of (win_pos, cap_idx, frame)
+            for win_pos, cap_idx in enumerate(visible):
+                cap      = all_caps[cap_idx]
+                is_active = (win_pos == active_win_idx)
+                has_green = is_active and elapsed_time < green_duration_sec
+
                 ret, frame = cap.read()
                 if not ret:
-                    # Loop video back to start
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ret, frame = cap.read()
                     if not ret:
                         frame = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
-                
-                # Resize frame
+
                 if frame is not None:
                     frame = cv2.resize(frame, (frame_width, frame_height))
-                
-                # Cache frame for pause effect on non-active lanes
-                if has_green_signal:
-                    current_frames[i] = frame
+
+                if has_green:
+                    current_frames[cap_idx] = frame          # update cache while green
                 else:
-                    # RED signal - use cached frame (pause effect)
-                    if current_frames[i] is not None:
-                        frame = current_frames[i]
+                    # RED/YELLOW — use cached (pause effect)
+                    if current_frames[cap_idx] is not None:
+                        frame = current_frames[cap_idx]
                     else:
-                        current_frames[i] = frame
-                
-                frames.append(frame)
-            
-            # Process each lane
+                        current_frames[cap_idx] = frame      # first frame ever
+
+                raw_frames.append((win_pos, cap_idx, frame))
+
+            # -----------------------------------------------------------------
+            # 2. Detect vehicles & annotate
+            # -----------------------------------------------------------------
             processed_frames = []
-            current_vehicle_counts = []
-            
-            for i, frame in enumerate(frames):
-                # Determine signal state and priority FIRST
-                priority = (i == active_lane)
-                
-                # Calculate elapsed time
+            for win_pos, cap_idx, frame in raw_frames:
+                is_active    = (win_pos == active_win_idx)
                 elapsed_time = time.time() - signal_start_time
-                
-                if i == active_lane:
-                    # Show yellow in the last 5 seconds
-                    if elapsed_time < (green_duration_sec - yellow_duration_sec):
-                        signal_state = 'GREEN'
-                    elif elapsed_time < green_duration_sec:
-                        signal_state = 'YELLOW'
-                    else:
-                        signal_state = 'YELLOW'
+
+                if is_active:
+                    remaining = green_duration_sec - elapsed_time
+                    signal_state = 'GREEN' if remaining > yellow_duration_sec else 'YELLOW'
                 else:
                     signal_state = 'RED'
-                
-                # ONLY DETECT VEHICLES WHEN SIGNAL IS RED (before turning green)
-                # Stop detection when signal is GREEN or YELLOW
+
                 if signal_state == 'RED':
-                    # Detect vehicles only for lanes with RED signal
-                    vehicle_count, annotated_frame, vehicle_breakdown = self.detect_vehicles_in_frame(frame.copy())
-                    vehicle_counts[i] = vehicle_count
-                    current_vehicle_counts.append(vehicle_count)
-                    vehicle_history[i].append(vehicle_count)
-                    
-                    # Keep only last 30 readings for average
-                    if len(vehicle_history[i]) > 30:
-                        vehicle_history[i].pop(0)
+                    vc, annotated, vb = self.detect_vehicles_in_frame(frame.copy())
+                    vehicle_counts[cap_idx] = vc
+                    vehicle_history[cap_idx].append(vc)
+                    if len(vehicle_history[cap_idx]) > 30:
+                        vehicle_history[cap_idx].pop(0)
                 else:
-                    # GREEN or YELLOW signal - stop detection, use cached frame and last count
-                    annotated_frame = frame.copy()
-                    vehicle_count = vehicle_counts[i]  # Use last known count
-                    current_vehicle_counts.append(vehicle_count)
-                    vehicle_breakdown = {}  # No new breakdown
-                
-                # Draw annotations
-                annotated_frame = self.draw_traffic_signal(
-                    annotated_frame,
-                    signal_state,
-                    lane_names[i],
-                    vehicle_count,
-                    vehicle_breakdown,
-                    priority
+                    annotated = frame.copy()
+                    vc = vehicle_counts[cap_idx]
+                    vb = {}
+
+                annotated = self.draw_traffic_signal(
+                    annotated, signal_state,
+                    lane_names[cap_idx], vc, vb, is_active
                 )
-                
-                # Add green light timing for active lane - near the signal
-                if i == active_lane and green_duration_sec > 0:
-                    elapsed_time = time.time() - signal_start_time
-                    remaining_time = max(0, int(green_duration_sec - elapsed_time))
-                    total_time = int(green_duration_sec)
-                    timing_text = f"{remaining_time}s"
-                    
-                    # Position timing near the signal (below the signal)
-                    signal_x = frame_width - 70  # Same x as signal
-                    signal_y = 60 + 60  # Below the signal
-                    
-                    # Draw timing background
-                    (tw, th), _ = cv2.getTextSize(timing_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
-                    cv2.rectangle(annotated_frame, 
-                                (signal_x - tw//2 - 10, signal_y - th - 10), 
-                                (signal_x + tw//2 + 10, signal_y + 10), 
-                                (0, 0, 0), -1)
-                    
-                    # Draw timing text in green
-                    cv2.putText(
-                        annotated_frame,
-                        timing_text,
-                        (signal_x - tw//2, signal_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1.2,
-                        (0, 255, 0),
-                        3,
-                        cv2.LINE_AA
-                    )
-                
-                processed_frames.append(annotated_frame)
-            
-            # Combine frames in 2x2 grid layout
-            if len(processed_frames) >= 4:
-                # Top row: Lane 1 and Lane 2
-                top_row = np.hstack([processed_frames[0], processed_frames[1]])
-                # Bottom row: Lane 3 and Lane 4
-                bottom_row = np.hstack([processed_frames[2], processed_frames[3]])
-                combined_frame = np.vstack([top_row, bottom_row])
-            elif len(processed_frames) == 3:
-                # Handle 3 lanes: top row with 2, bottom row with 1 centered
-                top_row = np.hstack([processed_frames[0], processed_frames[1]])
-                bottom_row = np.hstack([processed_frames[2], np.zeros((frame_height, frame_width, 3), dtype=np.uint8)])
-                combined_frame = np.vstack([top_row, bottom_row])
-            elif len(processed_frames) == 2:
-                # Handle 2 lanes: one row
-                combined_frame = np.hstack(processed_frames)
-            else:
-                combined_frame = processed_frames[0] if processed_frames else np.zeros((output_height, output_width, 3), dtype=np.uint8)
-            
-            # Add system info at bottom
-            avg_counts = [sum(hist)/len(hist) if hist else 0 for hist in vehicle_history]
-            vehicle_info = " | ".join([f"L{i+1}={vehicle_counts[i]}" for i in range(len(vehicle_counts))])
-            
-            if active_lane >= 0:
-                info_text = f"PRIORITY MODE | Active: {lane_names[active_lane]} ({int(green_duration_sec)}s) | Frame: {frame_count} | Vehicles: {vehicle_info}"
-            else:
-                info_text = f"PRIORITY MODE | Initializing... | Frame: {frame_count} | Vehicles: {vehicle_info}"
-            
-            cv2.rectangle(combined_frame, (0, output_height - 50), (output_width, output_height), (0, 0, 0), -1)
-            cv2.putText(
-                combined_frame,
-                info_text,
-                (10, output_height - 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA
+
+                # Countdown timer for the active lane
+                if is_active and green_duration_sec > 0:
+                    elapsed_time    = time.time() - signal_start_time
+                    remaining_time  = max(0, int(green_duration_sec - elapsed_time))
+                    timing_text     = f"{remaining_time}s"
+                    signal_x        = frame_width - 70
+                    signal_y        = 60 + 60
+                    (tw, th), _     = cv2.getTextSize(timing_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+                    cv2.rectangle(annotated,
+                                  (signal_x - tw//2 - 10, signal_y - th - 10),
+                                  (signal_x + tw//2 + 10, signal_y + 10),
+                                  (0, 0, 0), -1)
+                    cv2.putText(annotated, timing_text,
+                                (signal_x - tw//2, signal_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3, cv2.LINE_AA)
+
+                processed_frames.append(annotated)
+
+            # -----------------------------------------------------------------
+            # 3. Build 2×2 grid
+            # -----------------------------------------------------------------
+            top_row    = np.hstack([processed_frames[0], processed_frames[1]])
+            bottom_row = np.hstack([processed_frames[2], processed_frames[3]])
+            combined_frame = np.vstack([top_row, bottom_row])
+
+            # -----------------------------------------------------------------
+            # 4. Info bar at bottom
+            # -----------------------------------------------------------------
+            veh_info = " | ".join(
+                [f"L{cap_idx+1}={vehicle_counts[cap_idx]}" for _, cap_idx, _ in raw_frames]
             )
-            
-            # Display fullscreen fit
-            cv2.namedWindow('Smart Traffic Management System [PRIORITY MODE] - Press Q to quit', cv2.WINDOW_NORMAL)
-            cv2.imshow('Smart Traffic Management System [PRIORITY MODE] - Press Q to quit', combined_frame)
-            
-            # Calculate elapsed time for signal switching
+            if active_win_idx >= 0:
+                act_cap   = visible[active_win_idx]
+                info_text = (f"Round {window_round} | Window:[{win_label}] | "
+                             f"Active:{lane_names[act_cap]}({int(green_duration_sec)}s) | {veh_info}")
+            else:
+                info_text = (f"Round {window_round} | Window:[{win_label}] | "
+                             f"Initializing... | {veh_info}")
+
+            cv2.rectangle(combined_frame,
+                          (0, output_height - 50), (output_width, output_height),
+                          (0, 0, 0), -1)
+            cv2.putText(combined_frame, info_text, (10, output_height - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+            cv2.namedWindow('Smart Traffic Management System [PRIORITY MODE] - Press Q to quit',
+                            cv2.WINDOW_NORMAL)
+            cv2.imshow('Smart Traffic Management System [PRIORITY MODE] - Press Q to quit',
+                       combined_frame)
+
+            # -----------------------------------------------------------------
+            # 5. Signal logic
+            # -----------------------------------------------------------------
             elapsed_time = time.time() - signal_start_time
-            
-            # First cycle: set active lane based on priority (most vehicles)
-            if first_cycle and frame_count > 30:  # Wait 30 frames to collect data
-                active_lane = avg_counts.index(max(avg_counts))
-                green_duration_sec = self.calculate_green_duration(int(avg_counts[active_lane]), fps) / fps
-                first_cycle = False
-                signal_start_time = time.time()  # Reset timer
-                self.signal_lane_change(active_lane)  # Signal lane change
-                print(f"\n>>> First green light: {lane_names[active_lane]} with {int(avg_counts[active_lane])} vehicles ({int(green_duration_sec)}s green + {int(yellow_duration_sec)}s yellow)")
-            
-            # Switch lanes after green duration (yellow is included in the last 5 seconds)
-            if active_lane >= 0 and elapsed_time >= green_duration_sec:
-                # Alternate to next lane in sequence (priority-based rotation)
-                active_lane = (active_lane + 1) % len(caps)
-                
-                # Calculate green duration based on vehicle count
-                green_duration_sec = self.calculate_green_duration(int(avg_counts[active_lane]), fps) / fps
-                
-                # Reset timer for new signal cycle
-                signal_start_time = time.time()
-                
-                # Signal lane change for new lane
-                self.signal_lane_change(active_lane)
-                
-                print(f"\n>>> Switching to {lane_names[active_lane]} - {int(avg_counts[active_lane])} vehicles - {int(green_duration_sec)}s (last 5s yellow)")
-            
+
+            # --- First cycle: pick priority lane from the visible 4 ---
+            if first_cycle and frame_count > 30:
+                avg_counts = [
+                    sum(vehicle_history[visible[i]]) / len(vehicle_history[visible[i]])
+                    if vehicle_history[visible[i]] else 0
+                    for i in range(WINDOW_SIZE)
+                ]
+                active_win_idx     = avg_counts.index(max(avg_counts))
+                green_duration_sec = self.calculate_green_duration(
+                    int(avg_counts[active_win_idx]), fps) / fps
+                window_cycle       = 1          # this lane counts as the 1st in the window
+                first_cycle        = False
+                signal_start_time  = time.time()
+                # Signal uses window position (0-3) as physical lane — video rotates, hardware stays L1-L4
+                self.signal_lane_change(active_win_idx)
+                print(f"\n>>> Round {window_round} | Window:[{win_label}] | "
+                      f"First green → {lane_names[visible[active_win_idx]]} (Signal L{active_win_idx+1}) "
+                      f"({int(avg_counts[active_win_idx])} vehicles, {int(green_duration_sec)}s)")
+
+            # --- Switch lanes after green+yellow expires ---
+            if active_win_idx >= 0 and elapsed_time >= green_duration_sec:
+
+                if window_cycle >= WINDOW_SIZE:
+                    # ---- All 4 lanes in this window have had a turn → slide window ----
+                    window_start   = (window_start + 1) % num_total
+                    window_round  += 1
+                    window_cycle   = 0
+                    active_win_idx = 0          # start from the first lane of the new window
+                    visible        = [(window_start + i) % num_total for i in range(WINDOW_SIZE)]
+                    win_label      = " ".join([f"L{visible[i]+1}" for i in range(WINDOW_SIZE)])
+                    print(f"\n>>> Window shifted → Round {window_round} | New Window:[{win_label}]")
+                else:
+                    # ---- Move to next lane within the same window ----
+                    active_win_idx = (active_win_idx + 1) % WINDOW_SIZE
+
+                window_cycle += 1   # count the newly-activated lane
+
+                avg_counts = [
+                    sum(vehicle_history[visible[i]]) / len(vehicle_history[visible[i]])
+                    if vehicle_history[visible[i]] else 0
+                    for i in range(WINDOW_SIZE)
+                ]
+                green_duration_sec = self.calculate_green_duration(
+                    int(avg_counts[active_win_idx]), fps) / fps
+                signal_start_time  = time.time()
+                # Signal uses window position (0-3) as physical lane — video rotates, hardware stays L1-L4
+                self.signal_lane_change(active_win_idx)
+                print(f"\n>>> Round {window_round} | Window:[{win_label}] | "
+                      f"→ {lane_names[visible[active_win_idx]]} (Signal L{active_win_idx+1}) "
+                      f"({int(avg_counts[active_win_idx])} vehicles, {int(green_duration_sec)}s)")
+
             frame_count += 1
-            
-            if frame_count % 30 == 0 and active_lane >= 0:
-                print(f"Processed {frame_count} frames | Active: {lane_names[active_lane]} | Counts: {vehicle_counts}")
-            
-            # Wait for normal playback speed (1000ms / fps)
+
+            if frame_count % 30 == 0 and active_win_idx >= 0:
+                print(f"Frame {frame_count} | Window:[{win_label}] | "
+                      f"Active:{lane_names[visible[active_win_idx]]} | "
+                      f"Counts:{[vehicle_counts[visible[i]] for i in range(WINDOW_SIZE)]}")
+
             if cv2.waitKey(int(1000 / fps)) & 0xFF == ord('q'):
                 print("\nStopped by user")
                 break
-        
+
         # Cleanup
-        for cap in caps:
+        for cap in all_caps:
             cap.release()
         cv2.destroyAllWindows()
-        
         print(f"\n✓ Complete! Processed {frame_count} frames")
 
 
 def main():
     """
-    Main function - runs traffic system in priority mode with looping videos
+    Main function - runs traffic system with a sliding 4-lane window.
+
+    Loads up to 5 lane videos (lane 1.mp4 … lane 5.mp4).
+    Always shows exactly 4 lanes at a time in a 2x2 grid.
+    After every full 4-lane cycle the window shifts by 1:
+        Round 1: L1-L2-L3-L4
+        Round 2: L2-L3-L4-L5
+        Round 3: L3-L4-L5-L1
+        Round 4: L4-L5-L1-L2
+        Round 5: L5-L1-L2-L3  ... and repeats.
     """
     video_dir = Path("traffic video")
-    
-    # Check for 4 lane videos first, fallback to 3 if not available
+
+    # Collect all available lane videos (lane 1.mp4 … lane 5.mp4)
     video_paths = []
-    for i in range(1, 5):
+    for i in range(1, 6):
         video_path = video_dir / f"lane {i}.mp4"
         if video_path.exists():
             video_paths.append(video_path)
-    
-    # If less than 3 videos, try the original 3
-    if len(video_paths) < 3:
-        video_paths = [
-            video_dir / "lane 1.mp4",
-            video_dir / "lane 2.mp4",
-            video_dir / "lane 3.mp4"
-        ]
-    
-    # Check videos
-    for video_path in video_paths:
-        if not video_path.exists():
-            print(f"Error: Video not found: {video_path}")
-            return
-    
+
+    if len(video_paths) < 4:
+        print(f"Error: Need at least 4 lane videos. Found only {len(video_paths)}:")
+        for p in video_paths:
+            print(f"  ✓ {p}")
+        for i in range(1, 6):
+            p = video_dir / f"lane {i}.mp4"
+            if not p.exists():
+                print(f"  ✗ {p}  ← missing")
+        return
+
     print("=" * 80)
-    print("SMART AI TRAFFIC MANAGEMENT SYSTEM - PRIORITY MODE")
+    print("SMART AI TRAFFIC MANAGEMENT SYSTEM - SLIDING WINDOW MODE")
     print("=" * 80)
-    print(f"\n✓ Detected {len(video_paths)} lane(s)")
-    print(f"✓ Display: 2x2 Grid Layout (Perfect Screen Fit)")
-    print(f"✓ Mode: PRIORITY-BASED with alternating green signals")
-    print(f"✓ Behavior: RED signal = DETECT & PAUSE, GREEN signal = PLAY & NO DETECTION")
-    print(f"✓ Videos: Continuous loop until stopped")
-    print(f"✓ Detection: Only active on RED signal lanes (before green light)")
+    print(f"\n✓ Detected {len(video_paths)} lane video(s):")
+    for p in video_paths:
+        print(f"    {p.name}")
+    print(f"\n✓ Display : 2×2 Grid — always 4 lanes visible at a time")
+    print(f"✓ Mode    : Priority-based first green, then sequential rotation")
+    print(f"✓ Sliding : Window shifts by 1 lane after every full 4-lane cycle")
+    print(f"✓ Behavior: RED = detect & pause | GREEN/YELLOW = play, no detection")
     print(f"\nGreen Light Timing:")
-    print(f"  • Less than 10 vehicles → 15 seconds")
-    print(f"  • 20-25 vehicles → 25 seconds")
-    print(f"  • More than 30 vehicles → 30 seconds")
-    print(f"\nFirst green light goes to lane with most vehicles")
-    print(f"\nPress 'Q' to stop the system")
+    print(f"  • < 10 vehicles  →  ~15 seconds")
+    print(f"  • 20-30 vehicles →  ~25 seconds")
+    print(f"  • > 30 vehicles  →  ~30 seconds")
+    print(f"\nFirst green light goes to the lane with the most vehicles.")
+    print(f"Press 'Q' to stop.")
     print("=" * 80)
     print("\n🚦 Starting system...\n")
-    
-    # Create system
+
     tms = SmartTrafficManagementSystem(
         model_name='yolov8n.pt',
         confidence_threshold=0.3
     )
-    
-    # Run in priority mode
+
     tms.run_smart_traffic_system(video_paths=video_paths)
-    
+
     print("\n" + "=" * 70)
     print("SYSTEM COMPLETE")
     print("=" * 70)
