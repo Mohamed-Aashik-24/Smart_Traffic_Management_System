@@ -122,7 +122,6 @@ class SmartTrafficManagementSystem:
         elif vehicle_count > 30:
             duration_sec = 16
         else:
-            # Between 10 and 20: scale between 15 and 25 seconds
             duration_sec = 15 + ((vehicle_count - 10) / 10) * 10
         
         return int(duration_sec * fps)
