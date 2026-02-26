@@ -29,7 +29,10 @@ Smart Traffic Management System/
 ├── traffic video/                       # Input video files
 │   ├── lane 1.mp4
 │   ├── lane 2.mp4
-│   └── lane 3.mp4
+│   ├── lane 3.mp4
+|   ├── lane 4.mp4
+|   └── lane 5.mp4
+|   
 └── output/                              # Generated output videos
 ```
 
