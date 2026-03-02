@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 class SmartTrafficManagementSystem:
-    def __init__(self, model_name='yolov8n.pt', confidence_threshold=0.3):
+    def __init__(self, model_name='yolov8n.pt', confidence_threshold=0.6, enable_ambulance_detection=True):
         """
         Initialize the Smart Traffic Management System with vehicle detection
         This version prioritizes lanes with more vehicles
@@ -18,7 +18,8 @@ class SmartTrafficManagementSystem:
         print("Loading YOLO model...")
         self.model = YOLO(model_name)
         self.confidence_threshold = confidence_threshold
-
+        self.enable_ambulance_detection = enable_ambulance_detection            # After installing Tesseract to the default location
+     
         # Arduino communication disabled - running without hardware
         # self.arduino = serial.Serial('COM9', 9600)
         # time.sleep(2)
@@ -32,6 +33,13 @@ class SmartTrafficManagementSystem:
             1: 'bicycle'
         }
         
+        # Emergency vehicle detection (ambulance is typically detected as truck/bus)
+        # Note: This uses heuristics. For better accuracy, train a custom YOLO model.
+        self.ambulance_classes = {5: 'bus', 7: 'truck'}  # Ambulances detected as bus/truck
+        self.ambulance_conf_threshold = 0.60  # Threshold for ambulance detection
+        self.ambulance_min_area = 8000   # Minimum pixel area (smaller for compact ambulances)
+        self.ambulance_max_area = 35000  # Maximum pixel area (exclude large buses)
+        
         # Colors for different vehicle types (BGR format)
         self.colors = {
             'car': (0, 255, 0),        # Green
@@ -39,6 +47,7 @@ class SmartTrafficManagementSystem:
             'bus': (255, 0, 0),         # Blue
             'truck': (0, 165, 255),     # Orange
             'bicycle': (255, 255, 0),   # Cyan
+            'ambulance': (0, 0, 255),   # Red (Emergency)
         }
         
         # Traffic signal colors
@@ -52,17 +61,18 @@ class SmartTrafficManagementSystem:
         
     def detect_vehicles_in_frame(self, frame):
         """
-        Detect vehicles in a single frame
-        Returns vehicle count and annotated frame
+        Detect vehicles in a single frame including ambulances
+        Returns vehicle count, annotated frame, vehicle breakdown, and ambulance flag
         """
         if frame is None:
-            return 0, frame, {}
+            return 0, frame, {}, False
         
         # Run YOLO detection
         results = self.model(frame, conf=self.confidence_threshold, verbose=False)
         
         vehicle_counts = defaultdict(int)
         total_vehicles = 0
+        ambulance_detected = False
         
         for result in results:
             boxes = result.boxes
@@ -74,7 +84,55 @@ class SmartTrafficManagementSystem:
                 except Exception:
                     continue
                 
-                if class_id in self.vehicle_classes:
+                # Check for ambulance (high confidence bus/truck with specific characteristics)
+                is_ambulance = False
+                if self.enable_ambulance_detection and class_id in self.ambulance_classes:
+                    box_area = (x2 - x1) * (y2 - y1)
+                    
+                    # Multiple detection strategies to improve ambulance detection:
+                    # Strategy 1: Size and confidence based (works for most ambulances)
+                    # Strategy 2: Color-based (white or red colors typical of ambulances)
+                    
+                    if (confidence > self.ambulance_conf_threshold and 
+                        self.ambulance_min_area < box_area < self.ambulance_max_area):
+                        
+                        # Extract vehicle region for color analysis
+                        vehicle_region = frame[y1:y2, x1:x2]
+                        if vehicle_region.size > 0:
+                            hsv = cv2.cvtColor(vehicle_region, cv2.COLOR_BGR2HSV)
+                            
+                            # Check for white/light colors (common for ambulances)
+                            lower_white = np.array([0, 0, 180])  # Lowered threshold
+                            upper_white = np.array([180, 50, 255])  # More permissive
+                            white_mask = cv2.inRange(hsv, lower_white, upper_white)
+                            white_ratio = np.count_nonzero(white_mask) / white_mask.size
+                            
+                            # Check for red colors (ambulance markings, lights)
+                            lower_red1 = np.array([0, 100, 100])
+                            upper_red1 = np.array([10, 255, 255])
+                            lower_red2 = np.array([170, 100, 100])
+                            upper_red2 = np.array([180, 255, 255])
+                            red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+                            red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+                            red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+                            red_ratio = np.count_nonzero(red_mask) / red_mask.size
+                            
+                            # Detect as ambulance if (optimized for small/compact ambulances):
+                            # - More than 20% white/light (small ambulances often very white)
+                            # - OR has red markings (>8% red pixels)
+                            # - OR is a medium-sized vehicle with high confidence (exclude large buses)
+                            if (white_ratio > 0.20 or 
+                                red_ratio > 0.08 or 
+                                (confidence > 0.68 and 8000 < box_area < 35000)):
+                                is_ambulance = True
+                                ambulance_detected = True
+                                vehicle_type = 'ambulance'
+                                vehicle_counts['ambulance'] += 1
+                                # Debug logging
+                                print(f"🚨 AMBULANCE DETECTED! Confidence: {confidence:.2f}, "
+                                      f"Size: {box_area}, White: {white_ratio:.2%}, Red: {red_ratio:.2%}")
+                
+                if not is_ambulance and class_id in self.vehicle_classes:
                     vehicle_type = self.vehicle_classes[class_id]
                     vehicle_counts[vehicle_type] += 1
                     total_vehicles += 1
@@ -105,8 +163,40 @@ class SmartTrafficManagementSystem:
                         2,
                         cv2.LINE_AA,
                     )
+                elif is_ambulance:
+                    # Emergency vehicle - special rendering
+                    total_vehicles += 1
+                    color = self.colors['ambulance']
+                    
+                    # Draw thicker, flashing-style bounding box
+                    thickness = 5
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                    
+                    # Draw emergency label with warning
+                    label = f"⚠️ AMBULANCE: {confidence:.2f} ⚠️"
+                    (label_width, label_height), baseline = cv2.getTextSize(
+                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+                    )
+                    # Draw red background
+                    cv2.rectangle(
+                        frame,
+                        (x1, y1 - label_height - 15),
+                        (x1 + label_width, y1),
+                        (0, 0, 255),
+                        -1
+                    )
+                    cv2.putText(
+                        frame,
+                        label,
+                        (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
         
-        return total_vehicles, frame, dict(vehicle_counts)
+        return total_vehicles, frame, dict(vehicle_counts), ambulance_detected
     
     def calculate_green_duration(self, vehicle_count, fps):
         """
@@ -116,18 +206,18 @@ class SmartTrafficManagementSystem:
         More than 30: 30 seconds
         Returns duration in frames
         """
-        if vehicle_count < 10:
+        if  0 <= vehicle_count <= 10:
             duration_sec = 6
-        elif 20 <= vehicle_count <= 30:
+        elif 10 <= vehicle_count < 20:
+            duration_sec = 8
+        elif 20 <= vehicle_count <= 25:
             duration_sec = 11
-        elif vehicle_count > 30:
-            duration_sec = 16
         else:
-            duration_sec = 15 + ((vehicle_count - 10) / 10) * 10
+            duration_sec = 16
         
         return int(duration_sec * fps)
     
-    def draw_traffic_signal(self, frame, signal_state, lane_name, vehicle_count, vehicle_breakdown, priority=False):
+    def draw_traffic_signal(self, frame, signal_state, lane_name, vehicle_count, vehicle_breakdown, priority=False, emergency=True):
         """
         Draw traffic signal and vehicle count on frame
         """
@@ -135,13 +225,16 @@ class SmartTrafficManagementSystem:
         
         # Draw semi-transparent overlay at the top
         overlay = frame.copy()
-        overlay_height = 140
+        overlay_height = 160 if emergency else 140
         cv2.rectangle(overlay, (0, 0), (width, overlay_height), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
-        # Draw lane name with priority indicator
+        # Draw lane name with priority/emergency indicator
         lane_text = f"{lane_name}"
-        if priority:
+        if emergency:
+            lane_text += " [🚨 EMERGENCY 🚨]"
+            color = (0, 0, 255)  # Red for emergency
+        elif priority:
             lane_text += " [PRIORITY]"
             color = (0, 255, 255)  # Yellow for priority
         else:
@@ -247,16 +340,18 @@ class SmartTrafficManagementSystem:
 
     def run_smart_traffic_system(self, video_paths):
         """
-        Run the smart traffic management system with a sliding 4-lane window.
+        Run the smart traffic management system with dynamic lane rotation.
 
-        With N videos (e.g. 5), exactly 4 are displayed at a time in a 2x2 grid.
-        After every full 4-lane cycle, the window slides by 1:
-          Round 1 → Lanes 1-2-3-4
-          Round 2 → Lanes 2-3-4-5
-          Round 3 → Lanes 3-4-5-1  ... and so on.
+        With N videos (e.g. 6), exactly 4 are displayed at a time in a 2x2 grid.
+        When a lane finishes its green phase, it gets replaced with a lane from the hidden lanes:
+          Start → Lanes 1-2-3-4 visible (5-6 hidden)
+          After lane 2 finishes → Lanes 1-5-3-4 visible (2-6 hidden)  [2→5]
+          After lane 5 finishes → Lanes 1-6-3-4 visible (2-5 hidden)  [5→6]
+          After lane 6 finishes → Lanes 1-2-3-4 visible (5-6 hidden)  [6→2]
+          And so on... creating a continuous rotation where finished lanes swap with hidden ones.
 
         First green light goes to the lane with the most vehicles (priority).
-        Subsequent lanes rotate sequentially within the current window.
+        Subsequent lanes rotate sequentially through the 4 visible positions.
         """
         WINDOW_SIZE = 4  # always display this many lanes
 
@@ -289,9 +384,9 @@ class SmartTrafficManagementSystem:
         output_width  = frame_width  * 2
         output_height = frame_height * 2
 
-        print(f"\nProcessing {num_total} videos — displaying {WINDOW_SIZE} at a time (sliding window)")
+        print(f"\nProcessing {num_total} videos — displaying {WINDOW_SIZE} at a time (dynamic rotation)")
         print(f"Display: {output_width}x{output_height} @ {fps} FPS  |  Layout: 2×2 Grid")
-        print(f"Round 1: L1-L2-L3-L4  →  Round 2: L2-L3-L4-L5  →  Round 3: L3-L4-L5-L1 ...")
+        print("Dynamic Rotation: Each position cycles through all lanes as they finish green phase")
 
         lane_names = [f"LANE {i+1}" for i in range(num_total)]
 
@@ -299,11 +394,13 @@ class SmartTrafficManagementSystem:
         current_frames  = [None] * num_total   # cached frame for pause effect
         vehicle_counts  = [0]    * num_total
         vehicle_history = [[]    for _ in range(num_total)]
+        ambulance_flags = [False] * num_total  # Track ambulance detection per lane
 
-        # --- Sliding-window state ---
-        window_start    = 0   # which cap index is first in the visible 4
-        window_cycle    = 0   # greens given so far in this window (1-4)
-        window_round    = 1   # display round counter
+        # --- Dynamic rotation state ---
+        # visible_lanes tracks which lane is displayed in each position (0-3)
+        visible_lanes = list(range(WINDOW_SIZE))  # Start with lanes 0,1,2,3
+        lane_rotation_index = WINDOW_SIZE  # Track which non-visible lane to load next
+        lane_cycle_count = 0  # Total number of green phases completed
 
         # --- Signal state ---
         frame_count        = 0
@@ -315,8 +412,8 @@ class SmartTrafficManagementSystem:
 
         # =====================================================================
         while True:
-            # Current visible 4 cap indices
-            visible   = [(window_start + i) % num_total for i in range(WINDOW_SIZE)]
+            # Current visible lanes
+            visible = visible_lanes.copy()
             win_label = " ".join([f"L{visible[i]+1}" for i in range(WINDOW_SIZE)])
 
             elapsed_time = time.time() - signal_start_time
@@ -366,8 +463,9 @@ class SmartTrafficManagementSystem:
                     signal_state = 'RED'
 
                 if signal_state == 'RED':
-                    vc, annotated, vb = self.detect_vehicles_in_frame(frame.copy())
+                    vc, annotated, vb, ambulance = self.detect_vehicles_in_frame(frame.copy())
                     vehicle_counts[cap_idx] = vc
+                    ambulance_flags[cap_idx] = ambulance
                     vehicle_history[cap_idx].append(vc)
                     if len(vehicle_history[cap_idx]) > 30:
                         vehicle_history[cap_idx].pop(0)
@@ -378,7 +476,7 @@ class SmartTrafficManagementSystem:
 
                 annotated = self.draw_traffic_signal(
                     annotated, signal_state,
-                    lane_names[cap_idx], vc, vb, is_active
+                    lane_names[cap_idx], vc, vb, is_active, ambulance_flags[cap_idx]
                 )
 
                 # Countdown timer for the active lane
@@ -414,11 +512,10 @@ class SmartTrafficManagementSystem:
             )
             if active_win_idx >= 0:
                 act_cap   = visible[active_win_idx]
-                info_text = (f"Round {window_round} | Window:[{win_label}] | "
+                info_text = (f"Cycle {lane_cycle_count} | Current:[{win_label}] | "
                              f"Active:{lane_names[act_cap]}({int(green_duration_sec)}s) | {veh_info}")
             else:
-                info_text = (f"Round {window_round} | Window:[{win_label}] | "
-                             f"Initializing... | {veh_info}")
+                info_text = (f"Initializing... | Current:[{win_label}] | {veh_info}")
 
             cv2.rectangle(combined_frame,
                           (0, output_height - 50), (output_width, output_height),
@@ -436,42 +533,82 @@ class SmartTrafficManagementSystem:
             # -----------------------------------------------------------------
             elapsed_time = time.time() - signal_start_time
 
+            # --- Emergency override: Check for ambulance in any visible lane ---
+            emergency_lane = -1
+            for i in range(WINDOW_SIZE):
+                if ambulance_flags[visible[i]]:
+                    emergency_lane = i
+                    break
+            
+            # --- Override active lane if emergency detected ---
+            if emergency_lane >= 0 and active_win_idx != emergency_lane:
+                print(f"\n🚨🚨🚨 EMERGENCY: Ambulance detected in {lane_names[visible[emergency_lane]]} - Immediate override! 🚨🚨🚨")
+                active_win_idx = emergency_lane
+                green_duration_sec = 20  # Emergency override: 20 seconds
+                signal_start_time = time.time()
+                self.signal_lane_change(active_win_idx)
+            
             # --- First cycle: pick priority lane from the visible 4 ---
-            if first_cycle and frame_count > 30:
+            elif first_cycle and frame_count > 30:
                 avg_counts = [
                     sum(vehicle_history[visible[i]]) / len(vehicle_history[visible[i]])
                     if vehicle_history[visible[i]] else 0
                     for i in range(WINDOW_SIZE)
                 ]
-                active_win_idx     = avg_counts.index(max(avg_counts))
+                # Check for emergency first
+                if emergency_lane >= 0:
+                    active_win_idx = emergency_lane
+                    print(f"\n🚨 EMERGENCY PRIORITY: Ambulance in {lane_names[visible[emergency_lane]]}")
+                else:
+                    active_win_idx = avg_counts.index(max(avg_counts))
+                
                 green_duration_sec = self.calculate_green_duration(
                     int(avg_counts[active_win_idx]), fps) / fps
-                window_cycle       = 1          # this lane counts as the 1st in the window
+                
+                # Set to 5 seconds if ambulance detected
+                if ambulance_flags[visible[active_win_idx]]:
+                    green_duration_sec = 10
+                
+                lane_cycle_count += 1
                 first_cycle        = False
                 signal_start_time  = time.time()
                 # Signal uses window position (0-3) as physical lane — video rotates, hardware stays L1-L4
                 self.signal_lane_change(active_win_idx)
-                print(f"\n>>> Round {window_round} | Window:[{win_label}] | "
-                      f"First green → {lane_names[visible[active_win_idx]]} (Signal L{active_win_idx+1}) "
+                print(f"\n>>> Cycle {lane_cycle_count} | Window:[{win_label}] | "
+                      f"First green → {lane_names[visible[active_win_idx]]} (Position {active_win_idx+1}) "
                       f"({int(avg_counts[active_win_idx])} vehicles, {int(green_duration_sec)}s)")
 
             # --- Switch lanes after green+yellow expires ---
-            if active_win_idx >= 0 and elapsed_time >= green_duration_sec:
-
-                if window_cycle >= WINDOW_SIZE:
-                    # ---- All 4 lanes in this window have had a turn → slide window ----
-                    window_start   = (window_start + 1) % num_total
-                    window_round  += 1
-                    window_cycle   = 0
-                    active_win_idx = 0          # start from the first lane of the new window
-                    visible        = [(window_start + i) % num_total for i in range(WINDOW_SIZE)]
-                    win_label      = " ".join([f"L{visible[i]+1}" for i in range(WINDOW_SIZE)])
-                    print(f"\n>>> Window shifted → Round {window_round} | New Window:[{win_label}]")
+            elif active_win_idx >= 0 and elapsed_time >= green_duration_sec:
+                # Lane just finished - rotate this position to a lane NOT currently visible
+                finished_position = active_win_idx
+                old_lane = visible_lanes[finished_position]
+                
+                # Find lanes that are NOT currently visible (the hidden lanes)
+                non_visible_lanes = [lane_idx for lane_idx in range(num_total) 
+                                     if lane_idx not in visible_lanes]
+                
+                if non_visible_lanes:
+                    # Pick the next non-visible lane in rotation
+                    new_lane = non_visible_lanes[lane_rotation_index % len(non_visible_lanes)]
+                    lane_rotation_index += 1
+                    
+                    # Replace the finished lane with a non-visible lane
+                    visible_lanes[finished_position] = new_lane
+                    
+                    print(f"\n🔄 Position {finished_position+1} rotation: {lane_names[old_lane]} → {lane_names[new_lane]}")
+                    print(f"   Hidden lanes available: {', '.join([lane_names[l] for l in non_visible_lanes])}")
                 else:
-                    # ---- Move to next lane within the same window ----
-                    active_win_idx = (active_win_idx + 1) % WINDOW_SIZE
-
-                window_cycle += 1   # count the newly-activated lane
+                    # Fallback: if all lanes are visible (shouldn't happen with >4 lanes)
+                    print("\n⚠️ Warning: No hidden lanes available for rotation")
+                
+                # Move to next position for green light
+                active_win_idx = (active_win_idx + 1) % WINDOW_SIZE
+                lane_cycle_count += 1
+                
+                # Update visible lanes reference
+                visible = visible_lanes.copy()
+                win_label = " ".join([f"L{visible[i]+1}" for i in range(WINDOW_SIZE)])
 
                 avg_counts = [
                     sum(vehicle_history[visible[i]]) / len(vehicle_history[visible[i]])
@@ -483,15 +620,15 @@ class SmartTrafficManagementSystem:
                 signal_start_time  = time.time()
                 # Signal uses window position (0-3) as physical lane — video rotates, hardware stays L1-L4
                 self.signal_lane_change(active_win_idx)
-                print(f"\n>>> Round {window_round} | Window:[{win_label}] | "
-                      f"→ {lane_names[visible[active_win_idx]]} (Signal L{active_win_idx+1}) "
+                print(f"\n>>> Cycle {lane_cycle_count} | Window:[{win_label}] | "
+                      f"→ {lane_names[visible[active_win_idx]]} (Position {active_win_idx+1}) "
                       f"({int(avg_counts[active_win_idx])} vehicles, {int(green_duration_sec)}s)")
 
             frame_count += 1
 
             if frame_count % 30 == 0 and active_win_idx >= 0:
-                print(f"Frame {frame_count} | Window:[{win_label}] | "
-                      f"Active:{lane_names[visible[active_win_idx]]} | "
+                print(f"Frame {frame_count} | Current:[{win_label}] | "
+                      f"Active:{lane_names[visible[active_win_idx]]} (Pos {active_win_idx+1}) | "
                       f"Counts:{[vehicle_counts[visible[i]] for i in range(WINDOW_SIZE)]}")
 
             if cv2.waitKey(int(1000 / fps)) & 0xFF == ord('q'):
@@ -507,22 +644,21 @@ class SmartTrafficManagementSystem:
 
 def main():
     """
-    Main function - runs traffic system with a sliding 4-lane window.
+    Main function - runs traffic system with dynamic lane rotation.
 
-    Loads up to 5 lane videos (lane 1.mp4 … lane 5.mp4).
+    Loads up to 6 lane videos (lane 1.mp4 … lane 6.mp4).
     Always shows exactly 4 lanes at a time in a 2x2 grid.
-    After every full 4-lane cycle the window shifts by 1:
-        Round 1: L1-L2-L3-L4
-        Round 2: L2-L3-L4-L5
-        Round 3: L3-L4-L5-L1
-        Round 4: L4-L5-L1-L2
-        Round 5: L5-L1-L2-L3  ... and repeats.
+    When a lane finishes its green phase, it swaps with a hidden lane:
+        Start: L1-L2-L3-L4 visible (L5-L6 hidden)
+        After L2 finishes: L1-L5-L3-L4 visible (L2-L6 hidden)
+        After L5 finishes: L1-L6-L3-L4 visible (L2-L5 hidden)
+        Continues cycling, ensuring no duplicate lanes in the same window.
     """
     video_dir = Path("traffic video")
 
-    # Collect all available lane videos (lane 1.mp4 … lane 5.mp4)
+    # Collect all available lane videos (lane 1.mp4 … lane 6.mp4)
     video_paths = []
-    for i in range(1, 6):
+    for i in range(1, 7):
         video_path = video_dir / f"lane {i}.mp4"
         if video_path.exists():
             video_paths.append(video_path)
@@ -531,34 +667,49 @@ def main():
         print(f"Error: Need at least 4 lane videos. Found only {len(video_paths)}:")
         for p in video_paths:
             print(f"  ✓ {p}")
-        for i in range(1, 6):
+        for i in range(1, 7):
             p = video_dir / f"lane {i}.mp4"
             if not p.exists():
                 print(f"  ✗ {p}  ← missing")
         return
 
     print("=" * 80)
-    print("SMART AI TRAFFIC MANAGEMENT SYSTEM - SLIDING WINDOW MODE")
+    print("SMART AI TRAFFIC MANAGEMENT SYSTEM - DYNAMIC ROTATION MODE")
     print("=" * 80)
     print(f"\n✓ Detected {len(video_paths)} lane video(s):")
     for p in video_paths:
         print(f"    {p.name}")
-    print(f"\n✓ Display : 2×2 Grid — always 4 lanes visible at a time")
-    print(f"✓ Mode    : Priority-based first green, then sequential rotation")
-    print(f"✓ Sliding : Window shifts by 1 lane after every full 4-lane cycle")
-    print(f"✓ Behavior: RED = detect & pause | GREEN/YELLOW = play, no detection")
-    print(f"\nGreen Light Timing:")
-    print(f"  • < 10 vehicles  →  ~15 seconds")
-    print(f"  • 20-30 vehicles →  ~25 seconds")
-    print(f"  • > 30 vehicles  →  ~30 seconds")
-    print(f"\nFirst green light goes to the lane with the most vehicles.")
-    print(f"Press 'Q' to stop.")
+    print("\n✓ Display : 2×2 Grid — always 4 lanes visible at a time")
+    print("✓ Mode    : Priority-based first green, then sequential rotation")
+    print("✓ Dynamic : Each position rotates to next lane when it finishes green phase")
+    print("✓ Behavior: RED = detect & pause | GREEN/YELLOW = play, no detection")
+    print("\nGreen Light Timing:")
+    print("  • < 10 vehicles  →  ~15 seconds")
+    print("  • 20-30 vehicles →  ~25 seconds")
+    print("  • > 30 vehicles  →  ~30 seconds")
+    print("\n🚑 Ambulance Detection:")
+    print("  • ENABLED - Optimized for SMALL/COMPACT ambulances:")
+    print("    - White/light vehicles (>20% white pixels)")
+    print("    - Red markings detection (>8% red pixels)")
+    print("    - Medium-sized vehicles (8K-35K pixels, excludes large buses)")
+    print("  • Confidence threshold: >60%")
+    print("  • Emergency vehicles get immediate 20-second green light")
+    print("  • To disable: set enable_ambulance_detection=False")
+    print("\n🔄 Dynamic Rotation:")
+    print("  • When a lane finishes green, it swaps with a HIDDEN lane (not in window)")
+    print("  • Example: Window shows L1-L2-L3-L4 (L5-L6 hidden)")
+    print("    → L2 finishes → swaps with L5 → Window now L1-L5-L3-L4")
+    print("    → L5 finishes → swaps with L6 → Window now L1-L6-L3-L4")
+    print("  • Ensures NO duplicate lanes in the same window")
+    print("\nFirst green light goes to the lane with the most vehicles.")
+    print("Press 'Q' to stop.")
     print("=" * 80)
     print("\n🚦 Starting system...\n")
 
     tms = SmartTrafficManagementSystem(
         model_name='yolov8n.pt',
-        confidence_threshold=0.3
+        confidence_threshold=0.3,
+        enable_ambulance_detection=True  # Set to False to disable ambulance detection
     )
 
     tms.run_smart_traffic_system(video_paths=video_paths)

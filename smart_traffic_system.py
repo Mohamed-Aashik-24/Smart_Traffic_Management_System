@@ -9,11 +9,13 @@ import serial
 
 
 class SmartTrafficManagementSystem:
-    def __init__(self, model_name='yolov8n.pt', confidence_threshold=0.3):
+    def __init__(self, model_name='yolov8n.pt', confidence_threshold=0.6, enable_ambulance_detection=True):
         """
         Initialize the Smart Traffic Management System with vehicle detection
         This version prioritizes lanes with more vehicles
         """
+        
+        self.enable_ambulance_detection = enable_ambulance_detection
        
 
         print("Loading YOLO model...")
@@ -31,13 +33,22 @@ class SmartTrafficManagementSystem:
             1: 'bicycle'
         }
         
+        # Emergency vehicle detection (ambulance is typically detected as truck/bus)
+        # Note: This uses heuristics. For better accuracy, train a custom YOLO model.
+        self.ambulance_classes = {5: 'bus', 7: 'truck'}  # Ambulances detected as bus/truck
+        self.ambulance_conf_threshold = 0.60  # Threshold for ambulance detection
+        self.ambulance_min_area = 8000   # Minimum pixel area (smaller for compact ambulances)
+        self.ambulance_max_area = 35000  # Maximum pixel area (exclude large buses)
+        
         # Colors for different vehicle types (BGR format)
         self.colors = {
             'car': (0, 255, 0),        # Green
             'motorcycle': (0, 0, 255),  # Red
             'bus': (255, 0, 0),         # Blue
             'truck': (0, 165, 255),     # Orange
+
             'bicycle': (255, 255, 0),   # Cyan
+            'ambulance': (0, 0, 255),   # Red (Emergency)
         }
         
         # Traffic signal colors
@@ -51,17 +62,18 @@ class SmartTrafficManagementSystem:
         
     def detect_vehicles_in_frame(self, frame):
         """
-        Detect vehicles in a single frame
-        Returns vehicle count and annotated frame
+        Detect vehicles in a single frame including ambulances
+        Returns vehicle count, annotated frame, vehicle breakdown, and ambulance flag
         """
         if frame is None:
-            return 0, frame, {}
+            return 0, frame, {}, False
         
         # Run YOLO detection
         results = self.model(frame, conf=self.confidence_threshold, verbose=False)
         
         vehicle_counts = defaultdict(int)
         total_vehicles = 0
+        ambulance_detected = False
         
         for result in results:
             boxes = result.boxes
@@ -73,7 +85,55 @@ class SmartTrafficManagementSystem:
                 except Exception:
                     continue
                 
-                if class_id in self.vehicle_classes:
+                # Check for ambulance (high confidence bus/truck with specific characteristics)
+                is_ambulance = False
+                if self.enable_ambulance_detection and class_id in self.ambulance_classes:
+                    box_area = (x2 - x1) * (y2 - y1)
+                    
+                    # Multiple detection strategies to improve ambulance detection:
+                    # Strategy 1: Size and confidence based (works for most ambulances)
+                    # Strategy 2: Color-based (white or red colors typical of ambulances)
+                    
+                    if (confidence > self.ambulance_conf_threshold and 
+                        self.ambulance_min_area < box_area < self.ambulance_max_area):
+                        
+                        # Extract vehicle region for color analysis
+                        vehicle_region = frame[y1:y2, x1:x2]
+                        if vehicle_region.size > 0:
+                            hsv = cv2.cvtColor(vehicle_region, cv2.COLOR_BGR2HSV)
+                            
+                            # Check for white/light colors (common for ambulances)
+                            lower_white = np.array([0, 0, 180])  # Lowered threshold
+                            upper_white = np.array([180, 50, 255])  # More permissive
+                            white_mask = cv2.inRange(hsv, lower_white, upper_white)
+                            white_ratio = np.count_nonzero(white_mask) / white_mask.size
+                            
+                            # Check for red colors (ambulance markings, lights)
+                            lower_red1 = np.array([0, 100, 100])
+                            upper_red1 = np.array([10, 255, 255])
+                            lower_red2 = np.array([170, 100, 100])
+                            upper_red2 = np.array([180, 255, 255])
+                            red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+                            red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+                            red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+                            red_ratio = np.count_nonzero(red_mask) / red_mask.size
+                            
+                            # Detect as ambulance if (optimized for small/compact ambulances):
+                            # - More than 20% white/light (small ambulances often very white)
+                            # - OR has red markings (>8% red pixels)
+                            # - OR is a medium-sized vehicle with high confidence (exclude large buses)
+                            if (white_ratio > 0.20 or 
+                                red_ratio > 0.08 or 
+                                (confidence > 0.68 and 8000 < box_area < 35000)):
+                                is_ambulance = True
+                                ambulance_detected = True
+                                vehicle_type = 'ambulance'
+                                vehicle_counts['ambulance'] += 1
+                                # Debug logging
+                                print(f"🚨 AMBULANCE DETECTED! Confidence: {confidence:.2f}, "
+                                      f"Size: {box_area}, White: {white_ratio:.2%}, Red: {red_ratio:.2%}")
+                
+                if not is_ambulance and class_id in self.vehicle_classes:
                     vehicle_type = self.vehicle_classes[class_id]
                     vehicle_counts[vehicle_type] += 1
                     total_vehicles += 1
@@ -104,8 +164,40 @@ class SmartTrafficManagementSystem:
                         2,
                         cv2.LINE_AA,
                     )
+                elif is_ambulance:
+                    # Emergency vehicle - special rendering
+                    total_vehicles += 1
+                    color = self.colors['ambulance']
+                    
+                    # Draw thicker, flashing-style bounding box
+                    thickness = 5
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                    
+                    # Draw emergency label with warning
+                    label = f"⚠️ AMBULANCE: {confidence:.2f} ⚠️"
+                    (label_width, label_height), baseline = cv2.getTextSize(
+                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+                    )
+                    # Draw red background
+                    cv2.rectangle(
+                        frame,
+                        (x1, y1 - label_height - 15),
+                        (x1 + label_width, y1),
+                        (0, 0, 255),
+                        -1
+                    )
+                    cv2.putText(
+                        frame,
+                        label,
+                        (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
         
-        return total_vehicles, frame, dict(vehicle_counts)
+        return total_vehicles, frame, dict(vehicle_counts), ambulance_detected
     
     def calculate_green_duration(self, vehicle_count, fps):
         """
@@ -115,18 +207,18 @@ class SmartTrafficManagementSystem:
         More than 30: 30 seconds
         Returns duration in frames
         """
-        if vehicle_count < 10:
+        if  0 <= vehicle_count <= 10:
             duration_sec = 6
-        elif 20 <= vehicle_count <= 30:
+        elif 10 <= vehicle_count < 20:
+            duration_sec = 8
+        elif 20 <= vehicle_count <= 25:
             duration_sec = 11
-        elif vehicle_count > 30:
-            duration_sec = 16
         else:
-            duration_sec = 15 + ((vehicle_count - 10) / 10) * 10
+            duration_sec = 16
         
         return int(duration_sec * fps)
     
-    def draw_traffic_signal(self, frame, signal_state, lane_name, vehicle_count, vehicle_breakdown, priority=False):
+    def draw_traffic_signal(self, frame, signal_state, lane_name, vehicle_count, vehicle_breakdown, priority=False, emergency=False):
         """
         Draw traffic signal and vehicle count on frame
         """
@@ -134,13 +226,16 @@ class SmartTrafficManagementSystem:
         
         # Draw semi-transparent overlay at the top
         overlay = frame.copy()
-        overlay_height = 140
+        overlay_height = 160 if emergency else 140
         cv2.rectangle(overlay, (0, 0), (width, overlay_height), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
-        # Draw lane name with priority indicator
+        # Draw lane name with priority/emergency indicator
         lane_text = f"{lane_name}"
-        if priority:
+        if emergency:
+            lane_text += " [🚨 EMERGENCY 🚨]"
+            color = (0, 0, 255)  # Red for emergency
+        elif priority:
             lane_text += " [PRIORITY]"
             color = (0, 255, 255)  # Yellow for priority
         else:
@@ -299,6 +394,7 @@ class SmartTrafficManagementSystem:
         current_frames  = [None] * num_total   # cached frame for pause effect
         vehicle_counts  = [0]    * num_total
         vehicle_history = [[]    for _ in range(num_total)]
+        ambulance_flags = [False] * num_total  # Track ambulance detection per lane
 
         # --- Sliding-window state ---
         window_start    = 0   # which cap index is first in the visible 4
@@ -366,8 +462,9 @@ class SmartTrafficManagementSystem:
                     signal_state = 'RED'
 
                 if signal_state == 'RED':
-                    vc, annotated, vb = self.detect_vehicles_in_frame(frame.copy())
+                    vc, annotated, vb, ambulance = self.detect_vehicles_in_frame(frame.copy())
                     vehicle_counts[cap_idx] = vc
+                    ambulance_flags[cap_idx] = ambulance
                     vehicle_history[cap_idx].append(vc)
                     if len(vehicle_history[cap_idx]) > 30:
                         vehicle_history[cap_idx].pop(0)
@@ -378,7 +475,7 @@ class SmartTrafficManagementSystem:
 
                 annotated = self.draw_traffic_signal(
                     annotated, signal_state,
-                    lane_names[cap_idx], vc, vb, is_active
+                    lane_names[cap_idx], vc, vb, is_active, ambulance_flags[cap_idx]
                 )
 
                 # Countdown timer for the active lane
@@ -439,16 +536,42 @@ class SmartTrafficManagementSystem:
             # -----------------------------------------------------------------
             elapsed_time = time.time() - signal_start_time
 
+            # --- Emergency override: Check for ambulance in any visible lane ---
+            emergency_lane = -1
+            for i in range(WINDOW_SIZE):
+                if ambulance_flags[visible[i]]:
+                    emergency_lane = i
+                    break
+            
+            # --- Override active lane if emergency detected ---
+            if emergency_lane >= 0 and active_win_idx != emergency_lane:
+                print(f"\n🚨🚨🚨 EMERGENCY: Ambulance detected in {lane_names[visible[emergency_lane]]} - Immediate override! 🚨🚨🚨")
+                active_win_idx = emergency_lane
+                green_duration_sec = 20  # Emergency override: 20 seconds
+                signal_start_time = time.time()
+                self.send_to_arduino(active_win_idx)
+            
             # --- First cycle: pick priority lane from the visible 4 ---
-            if first_cycle and frame_count > 30:
+            elif first_cycle and frame_count > 30:
                 avg_counts = [
                     sum(vehicle_history[visible[i]]) / len(vehicle_history[visible[i]])
                     if vehicle_history[visible[i]] else 0
                     for i in range(WINDOW_SIZE)
                 ]
-                active_win_idx     = avg_counts.index(max(avg_counts))
+                # Check for emergency first
+                if emergency_lane >= 0:
+                    active_win_idx = emergency_lane
+                    print(f"\n🚨 EMERGENCY PRIORITY: Ambulance in {lane_names[visible[emergency_lane]]}")
+                else:
+                    active_win_idx = avg_counts.index(max(avg_counts))
+                
                 green_duration_sec = self.calculate_green_duration(
                     int(avg_counts[active_win_idx]), fps) / fps
+                
+                # Set to 10 seconds if ambulance detected
+                if ambulance_flags[visible[active_win_idx]]:
+                    green_duration_sec = 10
+                
                 window_cycle       = 1          # this lane counts as the 1st in the window
                 first_cycle        = False
                 signal_start_time  = time.time()
@@ -459,7 +582,7 @@ class SmartTrafficManagementSystem:
                       f"({int(avg_counts[active_win_idx])} vehicles, {int(green_duration_sec)}s)")
 
             # --- Switch lanes after green+yellow expires ---
-            if active_win_idx >= 0 and elapsed_time >= green_duration_sec:
+            elif active_win_idx >= 0 and elapsed_time >= green_duration_sec:
 
                 if window_cycle >= WINDOW_SIZE:
                     # ---- All 4 lanes in this window have had a turn → slide window ----
